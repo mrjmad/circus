@@ -1,11 +1,10 @@
 import errno
 from collections import defaultdict
+import select
+import socket
 
 from circus import util
 from circus import logger
-
-from select import select
-import socket
 from zmq.eventloop import ioloop
 
 
@@ -26,13 +25,13 @@ class BaseStatsCollector(ioloop.PeriodicCallback):
 
     def collect_stats(self):
         # should be implemented in subclasses
-        raise NotImplementedError()
+        raise NotImplementedError()  # PRAGMA: NOCOVER
 
 
 class WatcherStatsCollector(BaseStatsCollector):
     def _aggregate(self, aggregate):
-        res = {'pid': aggregate.keys()}
-        stats = aggregate.values()
+        res = {'pid': list(aggregate.keys())}
+        stats = list(aggregate.values())
 
         # aggregating CPU does not mean anything
         # but the average can be a good indicator
@@ -81,7 +80,7 @@ class WatcherStatsCollector(BaseStatsCollector):
             except util.NoSuchProcess:
                 # the process is gone !
                 pass
-            except Exception, e:
+            except Exception as e:
                 logger.exception('Failed to get info for %d. %s' % (pid,
                                                                     str(e)))
 
@@ -110,8 +109,7 @@ class SocketStatsCollector(BaseStatsCollector):
         super(SocketStatsCollector, self).__init__(streamer, name,
                                                    callback_time, io_loop)
         self._rstats = defaultdict(int)
-        self.sockets = [sock for sock, address, fd in
-                        self.streamer.get_sockets()]
+        self.sockets = [sock for sock, address, fd in self.streamer.sockets]
         self._p = ioloop.PeriodicCallback(self._select, _LOOP_RES,
                                           io_loop=io_loop)
 
@@ -125,9 +123,13 @@ class SocketStatsCollector(BaseStatsCollector):
 
     def _select(self):
         try:
-            rlist, wlist, xlist = select(self.sockets, [], [], .01)
-        except socket.error, err:
-            if err.errno == errno.EBADF:
+            rlist, wlist, xlist = select.select(self.sockets, [], [], .01)
+        except socket.error as err:
+            if err.errno in (errno.EBADF, errno.EINTR):
+                return
+            raise
+        except select.error as err:
+            if err.args[0] == errno.EINTR:
                 return
 
         if len(rlist) == 0:
@@ -136,7 +138,7 @@ class SocketStatsCollector(BaseStatsCollector):
         for sock in rlist:
             try:
                 fileno = sock.fileno()
-            except socket.error, err:
+            except socket.error as err:
                 if err.errno == errno.EBADF:
                     continue
                 else:
@@ -149,7 +151,7 @@ class SocketStatsCollector(BaseStatsCollector):
 
     def collect_stats(self):
         # sending hits by sockets
-        sockets = self.streamer.get_sockets()
+        sockets = self.streamer.sockets
 
         if len(sockets) == 0:
             yield None
@@ -159,7 +161,7 @@ class SocketStatsCollector(BaseStatsCollector):
             for sock, address, fd in sockets:
                 try:
                     fileno = sock.fileno()
-                except socket.error, err:
+                except socket.error as err:
                     if err.errno == errno.EBADF:
                         continue
                     else:

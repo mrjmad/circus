@@ -1,7 +1,8 @@
 import errno
-from circus import zmq
+import zmq
 
 from circus.util import DEFAULT_ENDPOINT_SUB, get_connection
+from circus.py3compat import b
 
 
 class CircusConsumer(object):
@@ -9,14 +10,13 @@ class CircusConsumer(object):
                  ssh_server=None, timeout=1.):
         self.topics = topics
         self.keep_context = context is not None
-        self.context = context or zmq.Context()
+        self._init_context(context)
         self.endpoint = endpoint
         self.pubsub_socket = self.context.socket(zmq.SUB)
         get_connection(self.pubsub_socket, self.endpoint, ssh_server)
         for topic in self.topics:
-            self.pubsub_socket.setsockopt(zmq.SUBSCRIBE, topic)
-        self.poller = zmq.Poller()
-        self.poller.register(self.pubsub_socket, zmq.POLLIN)
+            self.pubsub_socket.setsockopt(zmq.SUBSCRIBE, b(topic))
+        self._init_poller()
         self.timeout = timeout
 
     def __enter__(self):
@@ -29,6 +29,13 @@ class CircusConsumer(object):
     def __iter__(self):
         return self.iter_messages()
 
+    def _init_context(self, context):
+        self.context = context or zmq.Context()
+
+    def _init_poller(self):
+        self.poller = zmq.Poller()
+        self.poller.register(self.pubsub_socket, zmq.POLLIN)
+
     def iter_messages(self):
         """ Yields tuples of (topic, message) """
         with self:
@@ -38,6 +45,7 @@ class CircusConsumer(object):
                 except zmq.ZMQError as e:
                     if e.errno == errno.EINTR:
                         continue
+                    raise
 
                 if len(events) == 0:
                     continue

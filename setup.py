@@ -1,4 +1,3 @@
-import os
 import sys
 from setuptools import setup, find_packages
 from circus import __version__
@@ -7,10 +6,7 @@ if not hasattr(sys, 'version_info') or sys.version_info < (2, 6, 0, 'final'):
     raise SystemExit("Circus requires Python 2.6 or higher.")
 
 
-with open('pip-requirements.txt') as reqs:
-    install_requires = [
-        line for line in reqs.read().split('\n') if (line and not
-                                                     line.startswith('--'))]
+install_requires = ['psutil', 'pyzmq>=13.1.0', 'tornado>=3.0', 'six']
 
 try:
     import argparse     # NOQA
@@ -20,18 +16,13 @@ except ImportError:
 with open("README.rst") as f:
     README = f.read()
 
-changes = os.path.join('docs', 'source', 'changes.rst')
-
-with open(changes) as f:
-    CHANGES = f.read()
-
 
 setup(name='circus',
       version=__version__,
-      packages=find_packages(),
+      packages=find_packages(exclude=["docs", "examples"]),
       description=("Circus is a program that will let you run and watch "
                    " multiple processes and sockets."),
-      long_description=README + '\n' + CHANGES,
+      long_description=README,
       author="Mozilla Foundation & contributors",
       author_email="services-dev@lists.mozila.org",
       include_package_data=True,
@@ -40,10 +31,11 @@ setup(name='circus',
           "Programming Language :: Python",
           "Programming Language :: Python :: 2.6",
           "Programming Language :: Python :: 2.7",
-          "License :: OSI Approved :: Apache Software License",
-          "Development Status :: 3 - Alpha"],
+          "Programming Language :: Python :: 3.2",
+          "Programming Language :: Python :: 3.3",
+          "License :: OSI Approved :: Apache Software License"
+      ],
       install_requires=install_requires,
-      tests_require=['unittest2'],
       test_suite='circus.tests',
       entry_points="""
       [console_scripts]

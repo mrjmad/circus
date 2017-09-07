@@ -16,5 +16,11 @@ class CallError(Exception):
 
 class ArgumentError(Exception):
     """Exception raised when one argument or the number of
-    arguments invalid"""
+    arguments is invalid"""
+    pass
+
+
+class ConflictError(Exception):
+    """Exception raised when one exclusive command is already running
+    in background"""
     pass

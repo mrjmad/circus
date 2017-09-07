@@ -1,11 +1,11 @@
 from collections import defaultdict
-from circus import zmq
-import json
 from itertools import chain
 import os
 import errno
 import socket
 
+import zmq
+import zmq.utils.jsonapi as json
 from zmq.eventloop import ioloop, zmqstream
 
 from circus.commands import get_commands
@@ -13,12 +13,13 @@ from circus.client import CircusClient
 from circus.stats.collector import WatcherStatsCollector, SocketStatsCollector
 from circus.stats.publisher import StatsPublisher
 from circus import logger
+from circus.py3compat import s
 
 
 class StatsStreamer(object):
-    def __init__(self, endpoint, pubsub_endoint, stats_endpoint, ssh_server,
-                 delay=1., loop=None):
-        self.topic = 'watcher.'
+    def __init__(self, endpoint, pubsub_endoint, stats_endpoint,
+                 ssh_server=None, delay=1., loop=None):
+        self.topic = b'watcher.'
         self.delay = delay
         self.ctx = zmq.Context()
         self.pubsub_endpoint = pubsub_endoint
@@ -31,26 +32,24 @@ class StatsStreamer(object):
         self.client = CircusClient(context=self.ctx, endpoint=endpoint,
                                    ssh_server=ssh_server)
         self.cmds = get_commands()
+        self.publisher = StatsPublisher(stats_endpoint, self.ctx)
+        self._initialize()
+
+    def _initialize(self):
         self._pids = defaultdict(list)
         self._callbacks = dict()
-        self.publisher = StatsPublisher(stats_endpoint, self.ctx)
         self.running = False  # should the streamer be running?
         self.stopped = False  # did the collect started yet?
         self.circus_pids = {}
         self.sockets = []
-
-    def get_watchers(self):
-        return self._pids.keys()
-
-    def get_sockets(self):
-        return self.sockets
+        self.get_watchers = self._pids.keys
 
     def get_pids(self, watcher=None):
         if watcher is not None:
             if watcher == 'circus':
-                return self.circus_pids.keys()
+                return list(self.circus_pids.keys())
             return self._pids[watcher]
-        return chain(self._pids.values())
+        return chain(*list(self._pids.values()))
 
     def get_circus_pids(self):
         watchers = self.client.send_message('list').get('watchers', [])
@@ -113,12 +112,21 @@ class StatsStreamer(object):
         res = self.client.send_message('listsockets')
         for sock in res.get('sockets', []):
             fd = sock['fd']
-            address = '%s:%s' % (sock['host'], sock['port'])
+            if 'path' in sock:
+                # unix socket
+                address = sock['path']
+            else:
+                address = '%s:%s' % (sock['host'], sock['port'])
+
             # XXX type / family ?
             sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
             self.sockets.append((sock, address, fd))
 
         self._add_callback('sockets', kind='socket')
+
+    def stop_watcher(self, watcher):
+        for pid in self._pids[watcher]:
+            self.remove_pid(watcher, pid)
 
     def remove_pid(self, watcher, pid):
         if pid in self._pids[watcher]:
@@ -172,27 +180,25 @@ class StatsStreamer(object):
         """called each time circusd sends an event"""
         # maintains a periodic callback to compute mem and cpu consumption for
         # each pid.
-        logger.debug('Received an event from circusd: %s' % data)
-
+        logger.debug('Received an event from circusd: %s' % str(data))
         topic, msg = data
         try:
-            watcher = topic.split('.')[1:-1]
+            topic = s(topic)
+            watcher = topic.split('.')[1:-1][0]
             action = topic.split('.')[-1]
             msg = json.loads(msg)
-            if action == 'start' or (action != 'start' and self.stopped):
-                self._init()
 
             if action in ('reap', 'kill'):
                 # a process was reaped
                 pid = msg['process_pid']
                 self.remove_pid(watcher, pid)
             elif action == 'spawn':
+                # a process was added
                 pid = msg['process_pid']
                 self._append_pid(watcher, pid)
-            elif action == 'start':
-                self._init()
             elif action == 'stop':
-                self.stop()
+                # the whole watcher was stopped.
+                self.stop_watcher(watcher)
             else:
                 logger.debug('Unknown action: %r' % action)
                 logger.debug(msg)

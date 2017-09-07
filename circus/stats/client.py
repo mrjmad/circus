@@ -1,17 +1,19 @@
 import argparse
 import sys
-import json
 import curses
 from collections import defaultdict
 import errno
-import threading
+import circus.fixed_threading as threading
 import time
+import logging
 
-from circus import zmq
+import zmq
+import zmq.utils.jsonapi as json
 
 from circus.consumer import CircusConsumer
 from circus import __version__
 from circus.util import DEFAULT_ENDPOINT_STATS
+from circus.py3compat import s
 
 
 class StatsClient(CircusConsumer):
@@ -29,20 +31,24 @@ class StatsClient(CircusConsumer):
                 except zmq.ZMQError as e:
                     if e.errno == errno.EINTR:
                         continue
+                    raise
 
                 if len(events) == 0:
                     continue
 
                 try:
                     topic, stat = recv()
-                except zmq.core.error.ZMQError, e:
+                except zmq.core.error.ZMQError as e:
                     if e.errno != errno.EINTR:
                         raise
                     else:
-                        sys.exc_clear()
+                        try:
+                            sys.exc_clear()
+                        except Exception:
+                            pass
                         continue
 
-                topic = topic.split('.')
+                topic = s(topic).split('.')
                 if len(topic) == 3:
                     __, watcher, subtopic = topic
                     yield watcher, subtopic, json.loads(stat)
@@ -53,11 +59,24 @@ class StatsClient(CircusConsumer):
 
 def _paint(stdscr, watchers=None, old_h=None, old_w=None):
 
-    def addstr(line, *args):
-        if line < current_h:
-            stdscr.addstr(line, *args)
-
     current_h, current_w = stdscr.getmaxyx()
+
+    def addstr(x, y, text):
+        text_len = len(text)
+
+        if x < current_h:
+            padding = current_w - y
+            if text_len >= padding:
+                text = text[:padding - 1]
+            else:
+                text += ' ' * (padding - text_len - 1)
+
+            if text == '':
+                return
+
+            stdscr.addstr(x, y, text)
+
+    stdscr.erase()
 
     if watchers is None:
         stdscr.erase()
@@ -74,14 +93,13 @@ def _paint(stdscr, watchers=None, old_h=None, old_w=None):
 
     addstr(0, 0, 'Circus Top')
     addstr(1, 0, '-' * current_w)
-    names = watchers.keys()
-    names.sort()
+    names = sorted(watchers.keys())
     line = 2
     for name in names:
         if name in ('circusd-stats', 'circushttpd'):
             continue
 
-        stdscr.addstr(line, 0, name.replace('-', '.'))
+        addstr(line, 0, name.replace('-', '.'))
         line += 1
 
         if name == 'sockets':
@@ -92,7 +110,8 @@ def _paint(stdscr, watchers=None, old_h=None, old_w=None):
 
             fds = []
 
-            for __, stats in watchers[name].items():
+            total = 0
+            for stats in watchers[name].values():
                 if 'addresses' in stats:
                     total = stats['reads']
                     continue
@@ -159,8 +178,9 @@ def _paint(stdscr, watchers=None, old_h=None, old_w=None):
                 line += 1
             line += 1
 
-    if line <= current_h and len(watchers) > 0:
-        stdscr.addstr(line, 0, '-' * current_w)
+    if line < current_h and len(watchers) > 0:
+        addstr(line, 0, '-' * current_w)
+
     stdscr.refresh()
     return current_h, current_w
 
@@ -186,6 +206,7 @@ class Painter(threading.Thread):
 
 
 def main():
+    logging.basicConfig()
     desc = 'Runs Circus Top'
     parser = argparse.ArgumentParser(description=desc)
 
@@ -199,6 +220,11 @@ def main():
 
     parser.add_argument('--ssh', default=None, help='SSH Server')
 
+    parser.add_argument('--process-timeout',
+                        default=3,
+                        help='After this delay of inactivity, a process will \
+                         be removed')
+
     args = parser.parse_args()
 
     if args.version:
@@ -208,6 +234,7 @@ def main():
     stdscr = curses.initscr()
     watchers = defaultdict(dict)
     h, w = _paint(stdscr)
+    last_refresh_for_pid = defaultdict(float)
     time.sleep(1.)
 
     painter = Painter(stdscr, watchers, h, w)
@@ -221,6 +248,13 @@ def main():
                 stat['watcher'] = watcher
                 if subtopic is None:
                     subtopic = 'all'
+
+                # Clean pids that have not been updated recently
+                for pid in tuple(p for p in watchers[watcher] if p.isdigit()):
+                    if (last_refresh_for_pid[pid] <
+                            time.time() - int(args.process_timeout)):
+                        del watchers[watcher][pid]
+                last_refresh_for_pid[subtopic] = time.time()
 
                 # adding it to the structure
                 watchers[watcher][subtopic] = stat

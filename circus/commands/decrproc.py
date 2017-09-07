@@ -1,13 +1,14 @@
-from circus.commands.base import Command
-from circus.exc import ArgumentError
+from circus.commands.incrproc import IncrProc
+from circus.util import TransformableFuture
 
 
-class DecrProcess(Command):
+class DecrProc(IncrProc):
     """\
         Decrement the number of processes in a watcher
         ==============================================
 
-        This comment decrement the number of processes in a watcher by -1.
+        This comment decrement the number of processes in a watcher
+        by <nbprocess>, 1 being the default.
 
         ZMQ Message
         -----------
@@ -19,6 +20,7 @@ class DecrProcess(Command):
                 "propeties": {
                     "name": "<watchername>"
                     "nb": <nbprocess>
+                    "waiting": False
                 }
             }
 
@@ -32,32 +34,25 @@ class DecrProcess(Command):
 
         ::
 
-            $ circusctl descr <name> [<nbprocess>]
+            $ circusctl decr <name> [<nb>] [--waiting]
 
         Options
         +++++++
 
         - <name>: name of the watcher
-        - <nbprocess>: the number of processes to remove.
+        - <nb>: the number of processes to remove.
 
     """
-
     name = "decr"
     properties = ['name']
 
-    def message(self, *args, **opts):
-
-        if len(args) < 1:
-            raise ArgumentError("number of arguments invalid")
-
-        return self.make_message(name=args[0])
-
     def execute(self, arbiter, props):
         watcher = self._get_watcher(arbiter, props.get('name'))
-        nb = props.get('nb', 1)
-        return {"numprocesses": watcher.decr(nb)}
-
-    def console_msg(self, msg):
-        if msg.get("status") == "ok":
-            return str(msg.get("numprocesses"))
-        return self.console_error(msg)
+        if watcher.singleton:
+            return {"numprocesses": watcher.numprocesses, "singleton": True}
+        else:
+            nb = props.get('nb', 1)
+            resp = TransformableFuture()
+            resp.set_upstream_future(watcher.decr(nb))
+            resp.set_transform_function(lambda x: {"numprocesses": x})
+            return resp

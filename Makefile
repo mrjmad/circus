@@ -1,23 +1,29 @@
 .PHONY: docs build test coverage build_rpm clean
 
 ifndef VTENV_OPTS
-VTENV_OPTS = "--no-site-packages"
+VTENV_OPTS = -p python2.7 --no-site-packages
 endif
 
+VENV?=virtualenv
+
 bin/python:
-	virtualenv $(VTENV_OPTS) .
+	$(VENV) $(VTENV_OPTS) .
 	bin/python setup.py develop
 
 test: bin/python
 	bin/pip install tox
 	bin/tox
 
-docs: bin/coverage
-	bin/pip install sphinx
+docs:
+	bin/pip install -r doc-requirements.txt --use-mirrors
 	SPHINXBUILD=../bin/sphinx-build $(MAKE) -C docs html $^
 
 coverage: bin/coverage
-	bin/nosetests --with-coverage --cover-html --cover-html-dir=html --cover-package=circus
+	rm -f `pwd`/.coverage
+	rm -rf `pwd`/html
+	- COVERAGE_PROCESS_START=`pwd`/.coveragerc COVERAGE_FILE=`pwd`/.coverage PYTHONPATH=`pwd` bin/nosetests -s circus/tests
+	bin/coverage combine
+	bin/coverage html
 
 bin/coverage: bin/python
 	bin/pip install -r test-requirements.txt --use-mirrors
@@ -28,3 +34,5 @@ build_rpm:
 
 clean:
 	rm -rf bin .tox include/ lib/ man/ circus.egg-info/ build/
+	find . -name "*.pyc" | xargs rm -f
+	find . -name "*.un~" | xargs rm -f

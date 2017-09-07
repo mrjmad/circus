@@ -1,7 +1,9 @@
-from circus.plugins import CircusPlugin
+import socket
+
 from zmq.eventloop import ioloop
 
-import socket
+from circus.plugins import CircusPlugin
+from circus.util import human2bytes
 
 
 class StatsdClient(object):
@@ -16,12 +18,13 @@ class StatsdClient(object):
     def send(self, bucket, value, sample_rate=None):
         sample_rate = sample_rate or self.sample_rate
         if sample_rate != 1:
-            value += b"|@" + sample_rate
+            value += "|@%s" % sample_rate
 
         if self.prefix:
             bucket = "%s.%s" % (self.prefix, bucket)
 
-        self.socket.sendto("%s:%s" % (bucket, value), (self.host, self.port))
+        msg = "%s:%s" % (bucket, value)
+        self.socket.sendto(msg.encode('utf-8'), (self.host, self.port))
 
     def decrement(self, bucket, delta=1):
         if delta > 0:
@@ -36,6 +39,9 @@ class StatsdClient(object):
 
     def timed(self, bucket, value):
         self.send(bucket, "%s|ms" % value)
+
+    def stop(self):
+        self.socket.close()
 
 
 class StatsdEmitter(CircusPlugin):
@@ -59,18 +65,19 @@ class StatsdEmitter(CircusPlugin):
                                        config.get('sample_rate', '1.0')))
 
     def handle_recv(self, data):
-        topic, msg = data
-        topic_parts = topic.split(".")
-        watcher = topic_parts[1]
-        action = topic_parts[2]
-        self.statsd.increment('%s.%s' % (watcher, action))
+        watcher_name, action, msg = self.split_data(data)
+        self.statsd.increment('%s.%s' % (watcher_name, action))
+
+    def stop(self):
+        self.statsd.stop()
+        super(StatsdEmitter, self).stop()
 
 
 class BaseObserver(StatsdEmitter):
 
     def __init__(self, *args, **config):
         super(BaseObserver, self).__init__(*args, **config)
-        self.loop_rate = config.get("loop_rate", 60)  # in seconds
+        self.loop_rate = float(config.get("loop_rate", 60))  # in seconds
 
     def handle_init(self):
         self.period = ioloop.PeriodicCallback(self.look_after,
@@ -79,12 +86,13 @@ class BaseObserver(StatsdEmitter):
 
     def handle_stop(self):
         self.period.stop()
+        self.statsd.stop()
 
     def handle_recv(self, data):
         pass
 
     def look_after(self):
-        raise NotImplemented
+        raise NotImplementedError()
 
 
 class FullStats(BaseObserver):
@@ -97,21 +105,26 @@ class FullStats(BaseObserver):
             self.statsd.increment("_stats.error")
             return
 
-        for name, stats in info['infos'].iteritems():
+        for name, stats in info['infos'].items():
             if name.startswith("plugin:"):
                 # ignore plugins
                 continue
 
             cpus = []
             mems = []
+            mem_infos = []
 
-            for sub_info in stats.itervalues():
-                if isinstance(sub_info,  basestring):
-                    # dead processes have a string instead of actual info
-                    # ignore that
-                    continue
-                cpus.append(sub_info['cpu'])
-                mems.append(sub_info['mem'])
+            for sub_name, sub_info in stats.items():
+                if isinstance(sub_info, dict):
+                    cpus.append(sub_info['cpu'])
+                    mems.append(sub_info['mem'])
+                    mem_infos.append(human2bytes(sub_info['mem_info1']))
+                elif sub_name == "spawn_count":
+                    # spawn_count info is in the same level as processes
+                    # dict infos, so if spawn_count is given, take it and
+                    # continue
+                    self.statsd.gauge("_stats.%s.spawn_count" % name,
+                                      sub_info)
 
             self.statsd.gauge("_stats.%s.watchers_num" % name, len(cpus))
 
@@ -119,7 +132,10 @@ class FullStats(BaseObserver):
                 # if there are only dead processes, we have an empty list
                 # and we can't measure it
                 continue
+
             self.statsd.gauge("_stats.%s.cpu_max" % name, max(cpus))
             self.statsd.gauge("_stats.%s.cpu_sum" % name, sum(cpus))
-            self.statsd.gauge("_stats.%s.mem_max" % name, max(mems))
-            self.statsd.gauge("_stats.%s.mem_sum" % name, sum(mems))
+            self.statsd.gauge("_stats.%s.mem_pct_max" % name, max(mems))
+            self.statsd.gauge("_stats.%s.mem_pct_sum" % name, sum(mems))
+            self.statsd.gauge("_stats.%s.mem_max" % name, max(mem_infos))
+            self.statsd.gauge("_stats.%s.mem_sum" % name, sum(mem_infos))

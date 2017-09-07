@@ -3,11 +3,14 @@
 Installing Circus
 #################
 
-Use pip::
+Circus is a Python package which is published on PyPI - the Python Package Index.
+
+The simplest way to install it is to use pip, a tool for installing and managing Python packages::
 
     $ pip install circus
 
-Or download the archive on PyPI, extract and install it manually with::
+Or download the `archive on PyPI <https://pypi.python.org/pypi/circus>`_,
+extract and install it manually with::
 
     $ python setup.py install
 
@@ -31,20 +34,19 @@ use it by simply running the bootstrap script, then calling buildout::
 More on Requirements
 ====================
 
-Circus uses:
+Circus works with:
 
-- Python 2.6, 2.7 (3.x needs to be tested)
-- zeromq >= 2.10
+- Python 2.6, 2.7, 3.2 or 3.3
+- zeromq >= 2.1.10 
+    - The version of zeromq supported is ultimately determined by what version of `pyzmq <https://github.com/zeromq/pyzmq>`_ is installed by pip during circus installation.
+    - Their current release supports 2.x (limited), 3.x, and 4.x ZeroMQ versions.
+    - **Note**: If you are using PyPy instead of CPython, make sure to read their installation docs as ZeroMQ version support is not the same on PyPy.
 
-And on Python side:
+When you install circus, the latest
+versions of the Python dependencies will be pulled out for you.
 
-- pyzmq 2.2.0.1
-- iowait 0.1
-- psutil 0.4.1
-
-You can install all the py dependencies with the pip-requirements.txt file we
-provide manually, or just install Circus and have the latest versions
-of those libraries pulled for you::
+You can also install them manually using the pip-requirements.txt
+file we provide::
 
     $ pip install -r pip-requirements.txt
 

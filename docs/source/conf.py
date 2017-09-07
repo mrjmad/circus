@@ -12,6 +12,7 @@
 # serve to show the default.
 
 import sys, os
+import mozilla_sphinx_theme
 
 class Mock(object):
     def __init__(self, *args, **kwargs):
@@ -33,7 +34,6 @@ class Mock(object):
 MOCK_MODULES = ['zmq', 'zmq.eventloop', 'zmq.utils.jsonapi', 'zmq.utils']
 
 on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
-skip_coverage = os.environ.get('SKIP_COVERAGE', None) == 'True'
 
 if on_rtd:
     for mod_name in MOCK_MODULES:
@@ -60,9 +60,6 @@ sys.path.append(os.path.join(CURDIR, '..'))
 import circus
 extensions = ['sphinx.ext.autodoc', 'circus_ext']
 
-
-if not skip_coverage and not on_rtd:
-    extensions.append('coverage_ext')
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -101,7 +98,7 @@ release = version = circus.__version__
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
-exclude_patterns = []
+exclude_patterns = ['**/commands-intro.rst']
 
 # The reST default role (used for this markup: `text`) to use for all documents.
 #default_role = None
@@ -125,9 +122,10 @@ exclude_patterns = []
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-sys.path.append(os.path.abspath('_themes'))
-html_theme_path = ['_themes']
+
 html_short_title = "Circus"
+
+html_theme_path = [os.path.dirname(mozilla_sphinx_theme.__file__)]
 html_theme = 'mozilla'
 
 #html_logo = "images/circus32.png"
@@ -263,7 +261,17 @@ latex_documents = [
 # (source start file, name, description, authors, manual section).
 man_pages = [
     ('index', 'circus', u'Circus Documentation',
-     [u'Mozilla Foundation', u'Benoit Chesneau'], 1)
+     [u'Mozilla Foundation', u'Benoit Chesneau'], 1),
+    ('man/circusd', 'circusd', u'the circus daemon',
+     [u'David Douard'], 1),
+    ('man/circusctl', 'circusctl', u'circus daemon control insterface',
+     [u'David Douard'], 1),
+    ('man/circusd-stats', 'circusd-stats', u'circus daemon stats aggregator',
+     [u'David Douard'], 1),
+    ('man/circus-top', 'circus-top', u'display Circus processes',
+     [u'David Douard'], 1),
+    ('man/circus-plugin', 'circus-plugin', u'execute a Circus plugin',
+     [u'David Douard'], 1),
 ]
 
 # If true, show URL addresses after external links.

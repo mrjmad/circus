@@ -1,15 +1,21 @@
+import glob
 import os
-import fnmatch
-import sys
+import signal
+import warnings
+from fnmatch import fnmatch
+try:
+    import resource
+except ImportError:
+    resource = None     # NOQA
+
+import six
 
 from circus import logger
+from circus.py3compat import sort_by_field
 from circus.util import (DEFAULT_ENDPOINT_DEALER, DEFAULT_ENDPOINT_SUB,
-                         StrictConfigParser, parse_env_str)
-try:
-    import gevent       # NOQA
-    DEFAULT_STREAM = 'gevent'
-except ImportError:
-    DEFAULT_STREAM = 'thread'
+                         DEFAULT_ENDPOINT_MULTICAST, DEFAULT_ENDPOINT_STATS,
+                         StrictConfigParser, replace_gnu_args, to_signum,
+                         to_bool, papa)
 
 
 def watcher_defaults():
@@ -25,6 +31,8 @@ def watcher_defaults():
         'uid': None,
         'gid': None,
         'send_hup': False,
+        'stop_signal': signal.SIGTERM,
+        'stop_children': False,
         'max_retry': 5,
         'graceful_timeout': 30,
         'rlimits': dict(),
@@ -37,122 +45,178 @@ def watcher_defaults():
         'copy_path': False,
         'hooks': dict(),
         'respawn': True,
-        'autostart': True}
-
-
-_BOOL_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
-                '0': False, 'no': False, 'false': False, 'off': False}
-
-
-def to_boolean(value):
-    value = value.lower().strip()
-    if value not in _BOOL_STATES:
-        raise ValueError(value)
-    return _BOOL_STATES[value]
+        'autostart': True,
+        'use_papa': False}
 
 
 class DefaultConfigParser(StrictConfigParser):
+
+    def __init__(self, *args, **kw):
+        StrictConfigParser.__init__(self, *args, **kw)
+        self._env = dict(os.environ)
+
+    def set_env(self, env):
+        self._env = dict(env)
+
+    def get(self, section, option, **kwargs):
+        res = StrictConfigParser.get(self, section, option, **kwargs)
+        return replace_gnu_args(res, env=self._env)
+
+    def items(self, section, noreplace=False):
+        items = StrictConfigParser.items(self, section)
+        if noreplace:
+            return items
+
+        return [(key, replace_gnu_args(value, env=self._env))
+                for key, value in items]
+
     def dget(self, section, option, default=None, type=str):
         if not self.has_option(section, option):
             return default
-        if type is str:
-            return self.get(section, option)
-        elif type is int:
-            return self.getint(section, option)
+
+        value = self.get(section, option)
+
+        if type is int:
+            value = int(value)
         elif type is bool:
-            return self.getboolean(section, option)
-        else:
+            value = to_bool(value)
+        elif type is float:
+            value = float(value)
+        elif type is not str:
             raise NotImplementedError()
+
+        return value
+
+
+def rlimit_value(val):
+    if resource is not None and (val is None or len(val) == 0):
+        return resource.RLIM_INFINITY
+    else:
+        return int(val)
 
 
 def read_config(config_path):
     cfg = DefaultConfigParser()
     with open(config_path) as f:
-        cfg.readfp(f)
-    cfg_files_read = [config_path]
+        if hasattr(cfg, 'read_file'):
+            cfg.read_file(f)
+        else:
+            cfg.readfp(f)
 
     current_dir = os.path.dirname(config_path)
 
     # load included config files
     includes = []
 
-    def include_filename(filename):
-        if '*' in filename:
-            include_dir = os.path.dirname(filename)
-            if os.path.abspath(filename) != filename:
-                include_dir = os.path.join(current_dir,
-                                           os.path.dirname(filename))
+    def _scan(filename, includes):
+        if os.path.abspath(filename) != filename:
+            filename = os.path.join(current_dir, filename)
 
-            wildcard = os.path.basename(filename)
-            for root, dirnames, filenames in os.walk(include_dir):
-                for filename in fnmatch.filter(filenames, wildcard):
-                    cfg_file = os.path.join(root, filename)
-                    includes.append(cfg_file)
-
-        elif os.path.isfile(filename):
-            includes.append(filename)
+        paths = glob.glob(filename)
+        if paths == []:
+            logger.warn('%r does not lead to any config. Make sure '
+                        'include paths are relative to the main config '
+                        'file' % filename)
+        includes += paths
 
     for include_file in cfg.dget('circus', 'include', '').split():
-        include_filename(include_file)
+        _scan(include_file, includes)
 
     for include_dir in cfg.dget('circus', 'include_dir', '').split():
-        include_filename(os.path.join(include_dir, '*.ini'))
+        _scan(os.path.join(include_dir, '*.ini'), includes)
 
-    logger.debug('reading config files: %s' % includes)
-
-    cfg_files_read.extend(cfg.read(includes))
-
-    return cfg, cfg_files_read
+    logger.debug('Reading config files: %s' % includes)
+    return cfg, [config_path] + cfg.read(includes)
 
 
 def get_config(config_file):
     if not os.path.exists(config_file):
-        sys.stderr.write("the configuration file %r does not exist\n" %
-                         config_file)
-        sys.stderr.write("Exiting...\n")
-        sys.exit(1)
+        raise IOError("the configuration file %r does not exist\n" %
+                      config_file)
 
     cfg, cfg_files_read = read_config(config_file)
     dget = cfg.dget
     config = {}
 
+    # reading the global environ first
+    global_env = dict(os.environ.items())
+    local_env = dict()
+
+    # update environments with [env] section
+    if 'env' in cfg.sections():
+        local_env.update(dict(cfg.items('env')))
+        global_env.update(local_env)
+
+    # always set the cfg environment
+    cfg.set_env(global_env)
+
     # main circus options
-    config['check'] = dget('circus', 'check_delay', 5, int)
+    config['check_delay'] = dget('circus', 'check_delay', 5., float)
     config['endpoint'] = dget('circus', 'endpoint', DEFAULT_ENDPOINT_DEALER)
+    config['endpoint_owner'] = dget('circus', 'endpoint_owner', None, str)
     config['pubsub_endpoint'] = dget('circus', 'pubsub_endpoint',
                                      DEFAULT_ENDPOINT_SUB)
-    config['stats_endpoint'] = dget('circus', 'stats_endpoint', None, str)
+    config['multicast_endpoint'] = dget('circus', 'multicast_endpoint',
+                                        DEFAULT_ENDPOINT_MULTICAST)
+    config['stats_endpoint'] = dget('circus', 'stats_endpoint', None)
+    config['statsd'] = dget('circus', 'statsd', False, bool)
+    config['umask'] = dget('circus', 'umask', None)
+    if config['umask']:
+        config['umask'] = int(config['umask'], 8)
+
+    if config['stats_endpoint'] is None:
+        config['stats_endpoint'] = DEFAULT_ENDPOINT_STATS
+    elif not config['statsd']:
+        warnings.warn("You defined a stats_endpoint without "
+                      "setting up statsd to True.",
+                      DeprecationWarning)
+        config['statsd'] = True
+
     config['warmup_delay'] = dget('circus', 'warmup_delay', 0, int)
     config['httpd'] = dget('circus', 'httpd', False, bool)
     config['httpd_host'] = dget('circus', 'httpd_host', 'localhost', str)
     config['httpd_port'] = dget('circus', 'httpd_port', 8080, int)
     config['debug'] = dget('circus', 'debug', False, bool)
+    config['debug_gc'] = dget('circus', 'debug_gc', False, bool)
+    config['pidfile'] = dget('circus', 'pidfile')
+    config['loglevel'] = dget('circus', 'loglevel')
+    config['logoutput'] = dget('circus', 'logoutput')
+    config['loggerconfig'] = dget('circus', 'loggerconfig', None)
+    config['fqdn_prefix'] = dget('circus', 'fqdn_prefix', None, str)
+    config['papa_endpoint'] = dget('circus', 'fqdn_prefix', None, str)
 
     # Initialize watchers, plugins & sockets to manage
     watchers = []
-    environs = {}
     plugins = []
     sockets = []
 
     for section in cfg.sections():
+        section_items = dict(cfg.items(section))
+        if list(section_items.keys()) in [[], ['__name__']]:
+            # Skip empty sections
+            continue
         if section.startswith("socket:"):
-            sock = dict(cfg.items(section))
+            sock = section_items
             sock['name'] = section.split("socket:")[-1].lower()
+            sock['so_reuseport'] = dget(section, "so_reuseport", False, bool)
+            sock['replace'] = dget(section, "replace", False, bool)
             sockets.append(sock)
 
         if section.startswith("plugin:"):
-            plugins.append(dict(cfg.items(section)))
+            plugin = section_items
+            plugin['name'] = section
+            if 'priority' in plugin:
+                plugin['priority'] = int(plugin['priority'])
+            plugins.append(plugin)
 
         if section.startswith("watcher:"):
             watcher = watcher_defaults()
             watcher['name'] = section.split("watcher:", 1)[1]
 
             # create watcher options
-            for opt, val in cfg.items(section):
-                if opt == 'cmd':
-                    watcher['cmd'] = val
-                elif opt == 'args':
-                    watcher['args'] = val
+            for opt, val in cfg.items(section, noreplace=True):
+                if opt in ('cmd', 'args', 'working_dir', 'uid', 'gid'):
+                    watcher[opt] = val
                 elif opt == 'numprocesses':
                     watcher['numprocesses'] = dget(section, 'numprocesses', 1,
                                                    int)
@@ -162,23 +226,16 @@ def get_config(config_file):
                 elif opt == 'executable':
                     watcher['executable'] = dget(section, 'executable', None,
                                                  str)
-                elif opt == 'working_dir':
-                    watcher['working_dir'] = val
-                elif opt == 'shell':
-                    watcher['shell'] = dget(section, 'shell', False, bool)
-                elif opt == 'uid':
-                    watcher['uid'] = val
-                elif opt == 'gid':
-                    watcher['gid'] = val
-                elif opt == 'send_hup':
-                    watcher['send_hup'] = dget(section, 'send_hup', False,
-                                               bool)
-                elif opt == 'check_flapping':
-                    watcher['check_flapping'] = dget(section, 'check_flapping',
-                                                     True, bool)
+                # default bool to False
+                elif opt in ('shell', 'send_hup', 'stop_children',
+                             'close_child_stderr', 'use_sockets', 'singleton',
+                             'copy_env', 'copy_path', 'close_child_stdout'):
+                    watcher[opt] = dget(section, opt, False, bool)
+                elif opt == 'stop_signal':
+                    watcher['stop_signal'] = to_signum(val)
                 elif opt == 'max_retry':
                     watcher['max_retry'] = dget(section, "max_retry", 5, int)
-                elif opt == 'graceful_timout':
+                elif opt == 'graceful_timeout':
                     watcher['graceful_timeout'] = dget(
                         section, "graceful_timeout", 30, int)
                 elif opt.startswith('stderr_stream') or \
@@ -187,61 +244,88 @@ def get_config(config_file):
                     watcher[stream_name][stream_opt] = val
                 elif opt.startswith('rlimit_'):
                     limit = opt[7:]
-                    watcher['rlimits'][limit] = int(val)
+                    watcher['rlimits'][limit] = rlimit_value(val)
                 elif opt == 'priority':
                     watcher['priority'] = dget(section, "priority", 0, int)
-                elif opt == 'use_sockets':
-                    watcher['use_sockets'] = dget(section, "use_sockets",
-                                                  False, bool)
-                elif opt == 'singleton':
-                    watcher['singleton'] = dget(section, "singleton", False,
-                                                bool)
-                elif opt == 'copy_env':
-                    watcher['copy_env'] = dget(section, "copy_env", False,
-                                               bool)
-                elif opt == 'copy_path':
-                    watcher['copy_path'] = dget(section, "copy_path", False,
-                                                bool)
+                elif opt == 'use_papa' and dget(section, 'use_papa', False,
+                                                bool):
+                    if papa:
+                        watcher['use_papa'] = True
+                    else:
+                        warnings.warn("Config file says use_papa but the papa "
+                                      "module is missing.",
+                                      ImportWarning)
                 elif opt.startswith('hooks.'):
                     hook_name = opt[len('hooks.'):]
                     val = [elmt.strip() for elmt in val.split(',', 1)]
                     if len(val) == 1:
                         val.append(False)
                     else:
-                        val[1] = to_boolean(val[1])
+                        val[1] = to_bool(val[1])
 
                     watcher['hooks'][hook_name] = val
-
-                elif opt == 'respawn':
-                    watcher['respawn'] = dget(section, "respawn", True, bool)
-
-                elif opt == 'env':
-                    logger.warning('the env option is deprecated the use of '
-                                   'env sections is recommended')
-                    watcher['env'] = parse_env_str(val)
-
-                elif opt == 'autostart':
-                    watcher['autostart'] = dget(section, "autostart", True,
-                                                bool)
+                # default bool to True
+                elif opt in ('check_flapping', 'respawn', 'autostart',
+                             'close_child_stdin'):
+                    watcher[opt] = dget(section, opt, True, bool)
                 else:
                     # freeform
                     watcher[opt] = val
 
+            if watcher['copy_env']:
+                watcher['env'] = dict(global_env)
+            else:
+                watcher['env'] = dict(local_env)
+
             watchers.append(watcher)
 
-        if section.startswith('env:'):
-            for watcher in section.split("env:", 1)[1].split(','):
-                watcher = watcher.strip()
-                if not watcher in environs:
-                    environs[watcher] = dict()
-                environs[watcher].update([(k.upper(), v)
-                                          for k, v in cfg.items(section)])
+    # making sure we return consistent lists
+    sort_by_field(watchers)
+    sort_by_field(plugins)
+    sort_by_field(sockets)
 
+    # Second pass to make sure env sections apply to all watchers.
+
+    def _extend(target, source):
+        for name, value in source:
+            if name in target:
+                continue
+            target[name] = value
+
+    def _expand_vars(target, key, env):
+        if isinstance(target[key], six.string_types):
+            target[key] = replace_gnu_args(target[key], env=env)
+        elif isinstance(target[key], dict):
+            for k in target[key].keys():
+                _expand_vars(target[key], k, env)
+
+    def _expand_section(section, env, exclude=None):
+        if exclude is None:
+            exclude = ('name', 'env')
+
+        for option in section.keys():
+            if option in exclude:
+                continue
+            _expand_vars(section, option, env)
+
+    # build environment for watcher sections
+    for section in cfg.sections():
+        if section.startswith('env:'):
+            section_elements = section.split("env:", 1)[1]
+            watcher_patterns = [s.strip() for s in section_elements.split(',')]
+            env_items = dict(cfg.items(section, noreplace=True))
+
+            for pattern in watcher_patterns:
+                match = [w for w in watchers if fnmatch(w['name'], pattern)]
+
+                for watcher in match:
+                    watcher['env'].update(env_items)
+
+    # expand environment for watcher sections
     for watcher in watchers:
-        if watcher['name'] in environs:
-            if not 'env' in watcher:
-                watcher['env'] = dict()
-            watcher['env'].update(environs[watcher['name']])
+        env = dict(global_env)
+        env.update(watcher['env'])
+        _expand_section(watcher, env)
 
     config['watchers'] = watchers
     config['plugins'] = plugins

@@ -1,5 +1,6 @@
 from circus.commands.base import Command
 from circus.exc import ArgumentError
+from circus.util import TransformableFuture
 
 
 class IncrProc(Command):
@@ -7,7 +8,8 @@ class IncrProc(Command):
         Increment the number of processes in a watcher
         ==============================================
 
-        This comment increment the number of processes in a watcher by +1.
+        This comment increment the number of processes in a watcher
+        by <nbprocess>, 1 being the default
 
         ZMQ Message
         -----------
@@ -18,7 +20,8 @@ class IncrProc(Command):
                 "command": "incr",
                 "properties": {
                     "name": "<watchername>",
-                    "nb": <nbprocess>
+                    "nb": <nbprocess>,
+                    "waiting": False
                 }
             }
 
@@ -32,23 +35,28 @@ class IncrProc(Command):
 
         ::
 
-            $ circusctl incr <name> [<nbprocess>]
+            $ circusctl incr <name> [<nb>] [--waiting]
 
         Options
         +++++++
 
         - <name>: name of the watcher.
-        - <nbprocess>: the number of processes to add.
+        - <nb>: the number of processes to add.
 
     """
 
     name = "incr"
     properties = ['name']
+    options = Command.waiting_options
 
     def message(self, *args, **opts):
         if len(args) < 1:
-            raise ArgumentError("number of arguments invalid")
-        return self.make_message(name=args[0])
+            raise ArgumentError("Invalid number of arguments")
+        options = {'name': args[0]}
+        if len(args) > 1:
+            options['nb'] = int(args[1])
+        options.update(opts)
+        return self.make_message(**options)
 
     def execute(self, arbiter, props):
         watcher = self._get_watcher(arbiter, props.get('name'))
@@ -56,13 +64,16 @@ class IncrProc(Command):
             return {"numprocesses": watcher.numprocesses, "singleton": True}
         else:
             nb = props.get("nb", 1)
-            return {"numprocesses": watcher.incr(nb)}
+            resp = TransformableFuture()
+            resp.set_upstream_future(watcher.incr(nb))
+            resp.set_transform_function(lambda x: {"numprocesses": x})
+            return resp
 
     def console_msg(self, msg):
         if msg.get("status") == "ok":
             if "singleton" in msg:
-                return ('This watcher is a Singleton - not raising the number '
+                return ('This watcher is a Singleton - not changing the number'
                         ' of processes')
             else:
-                return str(msg.get("numprocesses"))
+                return str(msg.get("numprocesses", "ok"))
         return self.console_error(msg)

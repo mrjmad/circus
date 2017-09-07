@@ -1,9 +1,8 @@
-import signal
 import copy
 import textwrap
 import time
 
-from circus.exc import MessageError, ArgumentError
+from circus.exc import MessageError
 from circus.commands import errors
 
 
@@ -40,8 +39,10 @@ class CommandMeta(type):
     def __new__(cls, name, bases, attrs):
         super_new = type.__new__
         parents = [b for b in bases if isinstance(b, CommandMeta)]
+
         if not parents:
             return super_new(cls, name, bases, attrs)
+
         attrs["order"] = len(KNOWN_COMMANDS)
         new_class = super_new(cls, name, bases, attrs)
         new_class.fmt_desc()
@@ -60,6 +61,13 @@ class Command(object):
     msg_type = "dealer"
     options = []
     properties = []
+    waiting = False
+    waiting_options = [('waiting', 'waiting', False,
+                        "Waiting the real end of the process")]
+
+    ##################################################
+    # These methods run within the circusctl process #
+    ##################################################
 
     def make_message(self, **props):
         name = props.pop("command", self.name)
@@ -67,9 +75,6 @@ class Command(object):
 
     def message(self, *args, **opts):
         raise NotImplementedError("message function isn't implemented")
-
-    def execute(self, trainer, args):
-        raise NotImplementedError("execute function not implemented")
 
     def console_error(self, msg):
         return "error: %s" % msg.get("reason")
@@ -82,20 +87,19 @@ class Command(object):
     def copy(self):
         return copy.copy(self)
 
+    ################################################
+    # These methods run within the circusd process #
+    ################################################
+
+    def execute(self, arbiter, props):
+        raise NotImplementedError("execute function is not implemented")
+
     def _get_watcher(self, arbiter, watcher_name):
         """Get watcher from the arbiter if any."""
         try:
             return arbiter.get_watcher(watcher_name.lower())
         except KeyError:
             raise MessageError("program %s not found" % watcher_name)
-
-    def _get_signal(self, sig):
-        if sig.lower() in ('quit', 'hup', 'kill', 'term', 'ttin', 'ttou',
-                           'usr1', 'usr2'):
-            return getattr(signal, "SIG%s" % sig.upper())
-        elif sig.isdigit():
-            return int(sig)
-        raise ArgumentError("signal %r not supported" % sig)
 
     def validate(self, props):
         if not self.properties:
@@ -104,5 +108,6 @@ class Command(object):
         for propname in self.properties:
             if propname not in props:
                 raise MessageError("message invalid %r is missing" % propname)
+
 
 Command = CommandMeta('Command', (Command,), {})

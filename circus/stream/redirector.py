@@ -1,4 +1,3 @@
-import fcntl
 import errno
 import os
 import sys
@@ -6,77 +5,109 @@ import sys
 from zmq.eventloop import ioloop
 
 
-class NamedPipe(object):
-    def __init__(self, pipe, process, name):
-        self.pipe = pipe
-        self.process = process
-        self.name = name
-        fcntl.fcntl(pipe, fcntl.F_SETFL, os.O_NONBLOCK)
-        self._fileno = pipe.fileno()
-
-    def fileno(self):
-        return self._fileno
-
-    def read(self, buffer):
-        if self.pipe.closed:
-            return
-        return self.pipe.read(buffer)
-
-
 class Redirector(object):
-    def __init__(self, redirect, refresh_time=1.0, extra_info=None,
-                 buffer=1024, loop=None):
-        self.pipes = []
-        self._names = {}
-        self.redirect = redirect
-        self.extra_info = extra_info
-        self.buffer = buffer
+
+    class Handler(object):
+        def __init__(self, redirector, name, process, pipe):
+            self.redirector = redirector
+            self.name = name
+            self.process = process
+            self.pipe = pipe
+
+        def __call__(self, fd, events):
+            if not (events & ioloop.IOLoop.READ):
+                if events == ioloop.IOLoop.ERROR:
+                    self.redirector.remove_fd(fd)
+                return
+            try:
+                data = os.read(fd, self.redirector.buffer)
+                if len(data) == 0:
+                    self.redirector.remove_fd(fd)
+                else:
+                    datamap = {'data': data, 'pid': self.process.pid,
+                               'name': self.name}
+                    self.redirector.redirect[self.name](datamap)
+            except IOError as ex:
+                if ex.args[0] != errno.EAGAIN:
+                    raise
+                try:
+                    sys.exc_clear()
+                except Exception:
+                    pass
+
+    def __init__(self, stdout_redirect, stderr_redirect, buffer=1024,
+                 loop=None):
         self.running = False
-        if extra_info is None:
-            extra_info = {}
-        self.extra_info = extra_info
-        self.refresh_time = refresh_time * 1000
+        self.pipes = {}
+        self._active = {}
+        self.redirect = {'stdout': stdout_redirect, 'stderr': stderr_redirect}
+        self.buffer = buffer
         self.loop = loop or ioloop.IOLoop.instance()
-        self.caller = None
+
+    def _start_one(self, fd, stream_name, process, pipe):
+        if fd not in self._active:
+            handler = self.Handler(self, stream_name, process, pipe)
+            self.loop.add_handler(fd, handler, ioloop.IOLoop.READ)
+            self._active[fd] = handler
+            return 1
+        return 0
 
     def start(self):
-        self.caller = ioloop.PeriodicCallback(self._select, self.refresh_time,
-                                              self.loop)
-        self.caller.start()
+        count = 0
+        for fd, value in self.pipes.items():
+            name, process, pipe = value
+            count += self._start_one(fd, name, process, pipe)
+        self.running = True
+        return count
 
-    def kill(self):
-        if self.caller is None:
-            return
-        self.caller.stop()
+    def _stop_one(self, fd):
+        if fd in self._active:
+            self.loop.remove_handler(fd)
+            del self._active[fd]
+            return 1
+        return 0
 
-    def add_redirection(self, name, process, pipe):
-        npipe = NamedPipe(pipe, process, name)
-        self.pipes.append(npipe)
-        self._names[process.pid, name] = npipe
+    def stop(self):
+        count = 0
+        for fd in list(self._active.keys()):
+            count += self._stop_one(fd)
+        self.running = False
+        return count
 
-    def remove_redirection(self, name, process):
-        key = process.pid, name
-        if key not in self._names:
-            return
-        pipe = self._names[key]
-        self.pipes.remove(pipe)
-        del self._names[key]
+    @staticmethod
+    def get_process_pipes(process):
+        if process.pipe_stdout:
+            yield 'stdout', process.stdout
+        if process.pipe_stderr:
+            yield 'stderr', process.stderr
 
-    def _select(self):
-        if len(self.pipes) == 0:
-            return
+    def add_redirections(self, process):
+        for name, pipe in self.get_process_pipes(process):
+            fd = pipe.fileno()
+            self._stop_one(fd)
+            self.pipes[fd] = name, process, pipe
+            if self.running:
+                self._start_one(fd, name, process, pipe)
+        process.redirected = True
 
-        # we just try to read, if we see some data
-        # we just redirect it.
-        try:
-            for pipe in self.pipes:
-                data = pipe.read(self.buffer)
-                if data:
-                    datamap = {'data': data, 'pid': pipe.process.pid,
-                               'name': pipe.name}
-                    datamap.update(self.extra_info)
-                    self.redirect(datamap)
-        except IOError, ex:
-            if ex[0] != errno.EAGAIN:
-                raise
-            sys.exc_clear()
+    def remove_fd(self, fd):
+        self._stop_one(fd)
+        if fd in self.pipes:
+            del self.pipes[fd]
+
+    def remove_redirections(self, process):
+        for _, pipe in self.get_process_pipes(process):
+            try:
+                fileno = pipe.fileno()
+            except ValueError:
+                # the pipe was already closed
+                pass
+            else:
+                self.remove_fd(fileno)
+        process.redirected = False
+
+    def change_stream(self, stream_name, redirect_writer):
+        self.redirect[stream_name] = redirect_writer
+
+    def get_stream(self, stream_name):
+        return self.redirect.get(stream_name)

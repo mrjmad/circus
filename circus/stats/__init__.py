@@ -10,24 +10,15 @@ Stats architecture:
    stream of stats.
 """
 import sys
+import signal
 import argparse
-import logging
 
 from circus.stats.streamer import StatsStreamer
+from circus.util import configure_logger
+from circus.sighandler import SysHandler
 from circus import logger
 from circus import util
 from circus import __version__
-
-
-LOG_LEVELS = {
-    "critical": logging.CRITICAL,
-    "error": logging.ERROR,
-    "warning": logging.WARNING,
-    "info": logging.INFO,
-    "debug": logging.DEBUG}
-
-LOG_FMT = r"%(asctime)s [%(process)d] [%(levelname)s] %(message)s"
-LOG_DATE_FMT = r"%Y-%m-%d %H:%M:%S"
 
 
 def main():
@@ -65,19 +56,17 @@ def main():
         sys.exit(0)
 
     # configure the logger
-    loglevel = LOG_LEVELS.get(args.loglevel.lower(), logging.INFO)
-    logger.setLevel(loglevel)
-    if args.logoutput == "-":
-        h = logging.StreamHandler()
-    else:
-        h = logging.FileHandler(args.logoutput)
-        util.close_on_exec(h.stream.fileno())
-    fmt = logging.Formatter(LOG_FMT, LOG_DATE_FMT)
-    h.setFormatter(fmt)
-    logger.addHandler(h)
+    configure_logger(logger, args.loglevel, args.logoutput)
 
     stats = StatsStreamer(args.endpoint, args.pubsub, args.statspoint,
                           args.ssh)
+
+    # Register some sighandlers to stop the loop when killed
+    for sig in SysHandler.SIGNALS:
+        signal.signal(
+            sig, lambda *_: stats.loop.add_callback_from_signal(stats.stop)
+        )
+
     try:
         stats.start()
     finally:

@@ -44,7 +44,7 @@ class List(Command):
 
     def message(self, *args, **opts):
         if len(args) > 1:
-            raise ArgumentError("invalid number of arguments")
+            raise ArgumentError("Invalid number of arguments")
 
         if len(args) == 1:
             return self.make_message(name=args[0])
@@ -54,7 +54,6 @@ class List(Command):
     def execute(self, arbiter, props):
         if 'name' in props:
             watcher = self._get_watcher(arbiter, props['name'])
-
             processes = watcher.get_active_processes()
             status = [(p.pid, p.status) for p in processes]
             logger.debug('here is the status of the processes %s' % status)

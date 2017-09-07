@@ -1,19 +1,18 @@
 """ Base class to create Circus subscribers plugins.
 """
 import sys
-import logging
 import errno
 import uuid
 import argparse
 
-from circus import zmq
+import zmq
+import zmq.utils.jsonapi as json
 from zmq.eventloop import ioloop, zmqstream
-from zmq.utils.jsonapi import jsonmod as json
 
 from circus import logger, __version__
 from circus.client import make_message, cast_message
-from circus.util import (debuglog, to_bool, resolve_name, close_on_exec,
-                         LOG_LEVELS, LOG_FMT, LOG_DATE_FMT,
+from circus.py3compat import b, s
+from circus.util import (debuglog, to_bool, resolve_name, configure_logger,
                          DEFAULT_ENDPOINT_DEALER, DEFAULT_ENDPOINT_SUB,
                          get_connection)
 
@@ -36,17 +35,17 @@ class CircusPlugin(object):
         self.daemon = True
         self.config = config
         self.active = to_bool(config.get('active', True))
-        self.context = zmq.Context()
         self.pubsub_endpoint = pubsub_endpoint
         self.endpoint = endpoint
         self.check_delay = check_delay
         self.ssh_server = ssh_server
-        self.loop = ioloop.IOLoop()
-        self._id = uuid.uuid4().hex    # XXX os.getpid()+thread id is enough...
+        self._id = b(uuid.uuid4().hex)
         self.running = False
+        self.loop = ioloop.IOLoop()
 
     @debuglog
     def initialize(self):
+        self.context = zmq.Context()
         self.client = self.context.socket(zmq.DEALER)
         self.client.setsockopt(zmq.IDENTITY, self._id)
         get_connection(self.client, self.endpoint, self.ssh_server)
@@ -64,6 +63,7 @@ class CircusPlugin(object):
         self.handle_init()
         self.initialize()
         self.running = True
+
         while True:
             try:
                 self.loop.start()
@@ -80,12 +80,16 @@ class CircusPlugin(object):
                     raise
             else:
                 break
+
+        self.substream.close()
         self.client.close()
         self.sub_socket.close()
+        self.context.destroy()
 
     @debuglog
     def stop(self):
         if not self.running:
+            self.loop.close()
             return
 
         try:
@@ -96,12 +100,12 @@ class CircusPlugin(object):
         self.running = False
 
     def call(self, command, **props):
-        """Sends to **circusd** the command.
+        """Sends the command to **circusd**
 
         Options:
 
         - **command** -- the command to call
-        - **props** -- keywords argument to add to the call
+        - **props** -- keyword arguments to add to the call
 
         Returns the JSON mapping sent back by **circusd**
         """
@@ -116,7 +120,7 @@ class CircusPlugin(object):
         Options:
 
         - **command** -- the command to call
-        - **props** -- keywords argument to add to the call
+        - **props** -- keyword arguments to add to the call
         """
         msg = cast_message(command, **props)
         self.client.send(json.dumps(msg))
@@ -139,13 +143,25 @@ class CircusPlugin(object):
         pass
 
     def handle_init(self):
-        """Called right befor a plugin is started - in the thread context.
+        """Called right before a plugin is started - in the thread context.
         """
         pass
 
+    @staticmethod
+    def split_data(data):
+        topic, msg = data
+        topic_parts = s(topic).split(".")
+        return topic_parts[1], topic_parts[2], msg
+
+    @staticmethod
+    def load_message(msg):
+        return json.loads(msg)
+
 
 def _cfg2str(cfg):
-    return ':::'.join(['%s:%s' % (key, val) for key, val in cfg.items()])
+    return ':::'.join([
+         '%s:%s' % (key, val) for key, val in sorted(cfg.items())
+    ])
 
 
 def _str2cfg(data):
@@ -164,7 +180,7 @@ def _str2cfg(data):
 
 
 def get_plugin_cmd(config, endpoint, pubsub, check_delay, ssh_server,
-                   debug=False):
+                   debug=False, loglevel=None, logoutput=None):
     fqn = config['use']
     # makes sure the name exists
     resolve_name(fqn)
@@ -181,6 +197,10 @@ def get_plugin_cmd(config, endpoint, pubsub, check_delay, ssh_server,
         cmd += ' --config %s' % config
     if debug:
         cmd += ' --log-level DEBUG'
+    elif loglevel:
+        cmd += ' --log-level ' + loglevel
+    if logoutput:
+        cmd += ' --log-output ' + logoutput
     cmd += ' %s' % fqn
     return cmd
 
@@ -227,25 +247,18 @@ def main():
         parser.print_usage()
         sys.exit(0)
 
+    factory = resolve_name(args.plugin)
+
     # configure the logger
-    loglevel = LOG_LEVELS.get(args.loglevel.lower(), logging.INFO)
-    logger.setLevel(loglevel)
-    if args.logoutput == "-":
-        h = logging.StreamHandler()
-    else:
-        h = logging.FileHandler(args.logoutput)
-        close_on_exec(h.stream.fileno())
-    fmt = logging.Formatter(LOG_FMT, LOG_DATE_FMT)
-    h.setFormatter(fmt)
-    logger.addHandler(h)
+    configure_logger(logger, args.loglevel, args.logoutput, name=factory.name)
 
     # load the plugin and run it.
     logger.info('Loading the plugin...')
     logger.info('Endpoint: %r' % args.endpoint)
     logger.info('Pub/sub: %r' % args.pubsub)
-    plugin = resolve_name(args.plugin)(args.endpoint, args.pubsub,
-                                       args.check_delay, args.ssh,
-                                       **_str2cfg(args.config))
+    plugin = factory(args.endpoint, args.pubsub,
+                     args.check_delay, args.ssh,
+                     **_str2cfg(args.config))
     logger.info('Starting')
     try:
         plugin.start()

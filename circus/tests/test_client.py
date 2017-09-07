@@ -1,114 +1,127 @@
-# flake8: noqa
 import os
-import subprocess
-import time
+import tempfile
 
-from circus.tests.support import TestCircus
-from circus.client import CircusClient, make_message
+from tornado.testing import gen_test
+from tornado.gen import coroutine, Return
 
-# SSH_PATH = '/home/' + os.getlogin() + '/.ssh/'
-# SSH_ID_DSA = SSH_PATH + 'id_dsa'
-# SSH_ID_DSA_PUB = SSH_PATH + 'id_dsa.pub'
-# SSH_AUTHORIZED_KEYS = SSH_PATH + 'authorized_keys'
-
-COPY_ID_DSA = 'circus/tests/id_dsa'
-COPY_ID_DSA_PUB = 'circus/tests/id_dsa.pub'
-COPY_AUTHORIZED_KEYS = 'circus/tests/authorized_keys'
+from circus.util import tornado_sleep
+from circus.tests.support import TestCircus, EasyTestSuite, IS_WINDOWS
+from circus.client import make_message
+from circus.stream import QueueStream
 
 
 class TestClient(TestCircus):
+    @coroutine
+    def status(self, cmd, **props):
+        resp = yield self.call(cmd, **props)
+        raise Return(resp.get('status'))
 
-    def setUp(self):
-        TestCircus.setUp(self)
+    @coroutine
+    def numprocesses(self, cmd, **props):
+        resp = yield self.call(cmd, waiting=True, **props)
+        raise Return(resp.get('numprocesses'))
 
-        return
-        # XXX to be fixed
-        subprocess.call(['mv', SSH_ID_DSA, COPY_ID_DSA])
-        subprocess.call(['mv', SSH_ID_DSA_PUB, COPY_ID_DSA_PUB])
-        subprocess.call(['mv', SSH_AUTHORIZED_KEYS, COPY_AUTHORIZED_KEYS])
-        subprocess.call(['cp', 'circus/tests/test_dsa', SSH_ID_DSA])
-        subprocess.call(['cp', 'circus/tests/test_dsa.pub', SSH_ID_DSA_PUB])
-        subprocess.call(['cp', 'circus/tests/test_dsa.pub',
-                            SSH_AUTHORIZED_KEYS])
-        subprocess.call(['ssh-add'])
+    @coroutine
+    def numwatchers(self, cmd, **props):
+        resp = yield self.call(cmd, **props)
+        raise Return(resp.get('numwatchers'))
 
-    def tearDown(self):
-        TestCircus.tearDown(self)
+    @coroutine
+    def set(self, name, **opts):
+        resp = yield self.status("set", name=name, waiting=True, options=opts)
+        raise Return(resp)
 
-        return
-
-        # XXX to be fixed
-        subprocess.call(['rm', SSH_ID_DSA])
-        subprocess.call(['rm', SSH_ID_DSA_PUB])
-        subprocess.call(['rm', SSH_AUTHORIZED_KEYS])
-        subprocess.call(['mv', COPY_ID_DSA, SSH_ID_DSA])
-        subprocess.call(['mv', COPY_ID_DSA_PUB, SSH_ID_DSA_PUB])
-        subprocess.call(['mv', COPY_AUTHORIZED_KEYS, SSH_AUTHORIZED_KEYS])
-        subprocess.call(['ssh-add'])
-
-    def _client_test(self, ssh_server):
-        test_file = self._run_circus('circus.tests.support.run_process')
-        self.assertTrue(poll_for(test_file, 'START'))  # process started
-
+    @gen_test
+    def test_client(self):
         # playing around with the watcher
-        client = CircusClient(ssh_server=ssh_server)
+        yield self.start_arbiter()
+        msg = make_message("numwatchers")
+        resp = yield self.cli.call(msg)
+        self.assertEqual(resp.get("numwatchers"), 1)
+        self.assertEqual((yield self.numprocesses("numprocesses")), 1)
 
-        def call(cmd, **props):
-            msg = make_message(cmd, **props)
-            return client.call(msg)
+        self.assertEqual((yield self.set("test", numprocesses=2)), 'ok')
+        self.assertEqual((yield self.numprocesses("numprocesses")), 2)
 
-        def status(cmd, **props):
-            resp = call(cmd, **props)
-            return resp.get('status')
+        self.assertEqual((yield self.set("test", numprocesses=1)), 'ok')
+        self.assertEqual((yield self.numprocesses("numprocesses")), 1)
+        self.assertEqual((yield self.numwatchers("numwatchers")), 1)
 
-        def numprocesses(cmd, **props):
-            resp = call(cmd, **props)
-            return resp.get('numprocesses')
+        self.assertEqual((yield self.call("list")).get('watchers'), ['test'])
+        self.assertEqual((yield self.numprocesses("incr", name="test")), 2)
+        self.assertEqual((yield self.numprocesses("numprocesses")), 2)
+        self.assertEqual((yield self.numprocesses("incr", name="test", nb=2)),
+                         4)
+        self.assertEqual((yield self.numprocesses("decr", name="test", nb=3)),
+                         1)
+        self.assertEqual((yield self.numprocesses("numprocesses")), 1)
 
-        def numwatchers(cmd, **props):
-            resp = call(cmd, **props)
-            return resp.get('numwatchers')
-
-        def set(name, **opts):
-            return status("set", name=name, options=opts)
-
-        self.assertEquals(set("test", numprocesses=10), 'ok')
-        self.assertEquals(numprocesses("numprocesses"), 10)
-        self.assertEquals(set("test", numprocesses=1), 'ok')
-        self.assertEquals(numprocesses("numprocesses"), 1)
-        self.assertEquals(numwatchers("numwatchers"), 1)
-
-        self.assertEquals(call("list").get('watchers'), ['test'])
-        self.assertEquals(numprocesses("incr", name="test"), 2)
-        self.assertEquals(numprocesses("numprocesses"), 2)
-        self.assertEquals(numprocesses("incr", name="test", nb=2), 4)
-        self.assertEquals(numprocesses("decr", name="test", nb=3), 1)
-        self.assertEquals(numprocesses("numprocesses"), 1)
-        self.assertEquals(set("test", env={"test": 1, "test": 2}), 'error')
-        self.assertEquals(set("test", env={"test": '1', "test": '2'}),
-                'ok')
-        resp = call('get', name='test', keys=['env'])
+        if IS_WINDOWS:
+            # On Windows we can't set an env to a process without some keys
+            env = dict(os.environ)
+        else:
+            env = {}
+        env['test'] = 2
+        self.assertEqual((yield self.set("test", env=env)), 'error')
+        env['test'] = '2'
+        self.assertEqual((yield self.set("test", env=env)), 'ok')
+        resp = yield self.call('get', name='test', keys=['env'])
         options = resp.get('options', {})
+        self.assertEqual(options.get('env', {}), env)
 
-        self.assertEquals(options.get('env'), {'test': '1', 'test': '2'})
-
-        resp = call('stats', name='test')
+        resp = yield self.call('stats', name='test')
         self.assertEqual(resp['status'], 'ok')
 
-        resp = call('globaloptions', name='test')
+        resp = yield self.call('globaloptions', name='test')
         self.assertEqual(resp['options']['pubsub_endpoint'],
-                        'tcp://127.0.0.1:5556')
-        client.stop()
+                         self.arbiter.pubsub_endpoint)
+        yield self.stop_arbiter()
 
-    #def XXX_test_handler(self):
-    #    self._client_test(None)
 
-    #def XXX_test_handler_ssh(self):
-    #    try:
-    #        try:
-    #            import pexpect    # NOQA
-    #        except ImportError:
-    #            import paramiko   # NOQA
-    #    except ImportError:
-    #        return
-    #    self._client_test('localhost')
+_, tmp_filename = tempfile.mkstemp(prefix='test_hook')
+
+
+def long_hook(*args, **kw):
+    os.unlink(tmp_filename)
+
+
+class TestWithHook(TestCircus):
+    def run_with_hooks(self, hooks):
+        self.stream = QueueStream()
+        self.errstream = QueueStream()
+        dummy_process = 'circus.tests.support.run_process'
+        return self._create_circus(dummy_process, async=True,
+                                   stdout_stream={'stream': self.stream},
+                                   stderr_stream={'stream': self.errstream},
+                                   hooks=hooks)
+
+    @gen_test
+    def test_message_id(self):
+        hooks = {'before_stop': ('circus.tests.test_client.long_hook', False)}
+        testfile, arbiter = self.run_with_hooks(hooks)
+        yield arbiter.start()
+        try:
+            self.assertTrue(os.path.exists(tmp_filename))
+
+            msg = make_message("numwatchers")
+            resp = yield self.cli.call(msg)
+            self.assertEqual(resp.get("numwatchers"), 1)
+
+            # this should timeout
+            resp = yield self.cli.call(make_message("stop"))
+            self.assertEqual(resp.get('status'), 'ok')
+
+            while arbiter.watchers[0].status() != 'stopped':
+                yield tornado_sleep(.1)
+
+            resp = yield self.cli.call(make_message("numwatchers"))
+            self.assertEqual(resp.get("numwatchers"), 1)
+
+            self.assertFalse(os.path.exists(tmp_filename))
+        finally:
+            if os.path.exists(tmp_filename):
+                os.unlink(tmp_filename)
+            arbiter.stop()
+
+
+test_suite = EasyTestSuite(__name__)
